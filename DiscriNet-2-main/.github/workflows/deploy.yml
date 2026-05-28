@@ -1,0 +1,198 @@
+name: Deploy to AWS EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  EC2_APP_DIR: /home/ubuntu/hate-speech-detection
+
+jobs:
+  test:
+    name: Lint & Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Import smoke test
+        run: |
+          python -c "
+          import gradio, torch, transformers, peft, joblib, numpy
+          from langchain_google_genai import ChatGoogleGenerativeAI
+          from langchain_huggingface import HuggingFaceEmbeddings
+          from langchain_community.vectorstores import FAISS
+          from langchain_core.prompts import PromptTemplate
+          print('All critical imports OK')
+          "
+
+  deploy:
+    name: Deploy to EC2
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/ec2_key.pem
+          chmod 600 ~/.ssh/ec2_key.pem
+          head -1 ~/.ssh/ec2_key.pem | grep -q "BEGIN" || { echo "ERROR: PEM key malformed"; exit 1; }
+          echo "Host ec2"                                        >> ~/.ssh/config
+          echo "  HostName ${{ secrets.EC2_HOST }}"              >> ~/.ssh/config
+          echo "  User ${{ secrets.EC2_USER }}"                  >> ~/.ssh/config
+          echo "  IdentityFile ~/.ssh/ec2_key.pem"               >> ~/.ssh/config
+          echo "  StrictHostKeyChecking no"                      >> ~/.ssh/config
+          echo "  UserKnownHostsFile /dev/null"                  >> ~/.ssh/config
+          chmod 644 ~/.ssh/config
+          ssh ec2 "echo 'SSH connection OK'"
+
+      - name: Sync code to EC2
+        run: |
+          rsync -avz --delete \
+            --exclude '.git' \
+            --exclude '__pycache__' \
+            --exclude '.env' \
+            --exclude 'logs/' \
+            --exclude 'runs/' \
+            --exclude 'results/' \
+            --exclude 'policies/*.pt' \
+            --exclude 'app.pid' \
+            --exclude '*.pyc' \
+            ./ ec2:${{ env.EC2_APP_DIR }}/
+
+      - name: Write environment variables
+        env:
+          K1: ${{ secrets.GEMINI_API_KEY_1 }}
+          K2: ${{ secrets.GEMINI_API_KEY_2 }}
+          K3: ${{ secrets.GEMINI_API_KEY_3 }}
+          K4: ${{ secrets.GEMINI_API_KEY_4 }}
+          K5: ${{ secrets.GEMINI_API_KEY_5 }}
+          K6: ${{ secrets.GEMINI_API_KEY_6 }}
+          K7: ${{ secrets.GEMINI_API_KEY_7 }}
+          K8: ${{ secrets.GEMINI_API_KEY_8 }}
+          K9: ${{ secrets.GEMINI_API_KEY_9 }}
+          K10: ${{ secrets.GEMINI_API_KEY_10 }}
+        run: |
+          ENV_FILE=$(mktemp)
+          KEY_COUNT=0
+          for i in $(seq 1 10); do
+            VAR="K${i}"
+            VAL="${!VAR}"
+            if [ -n "$VAL" ]; then
+              echo "GEMINI_API_KEY_${i}=${VAL}" >> "$ENV_FILE"
+              KEY_COUNT=$((KEY_COUNT + 1))
+            fi
+          done
+          echo "Writing ${KEY_COUNT} key(s) to .env"
+          scp -q "$ENV_FILE" ec2:/home/ubuntu/hate-speech-detection/.env
+          rm -f "$ENV_FILE"
+
+      - name: Setup supervisord and start app
+        run: |
+          ssh ec2 "bash -s" << 'ENDSSH'
+          set -e
+          cd /home/ubuntu/hate-speech-detection
+          mkdir -p logs
+
+          # Install supervisor into conda env if missing
+          source /home/ubuntu/miniconda3/etc/profile.d/conda.sh
+          conda activate ml
+          pip install supervisor --quiet
+
+          # Write start.sh (activates conda env then runs app)
+          cat > start.sh << 'EOF'
+          #!/bin/bash
+          source /home/ubuntu/miniconda3/etc/profile.d/conda.sh
+          conda activate ml
+          exec python app.py
+          EOF
+          chmod +x start.sh
+
+          # Write supervisord.conf
+          cat > supervisord.conf << 'EOF'
+          [supervisord]
+          logfile=logs/supervisord.log
+          pidfile=logs/supervisord.pid
+          nodaemon=false
+
+          [supervisorctl]
+          serverurl=unix:///tmp/supervisor-hate-speech.sock
+
+          [unix_http_server]
+          file=/tmp/supervisor-hate-speech.sock
+
+          [rpcinterface:supervisor]
+          supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+          [program:hate-speech-app]
+          command=/home/ubuntu/hate-speech-detection/start.sh
+          directory=/home/ubuntu/hate-speech-detection
+          autostart=true
+          autorestart=true
+          stderr_logfile=logs/app.error.log
+          stdout_logfile=logs/app.log
+          stdout_logfile_maxbytes=50MB
+          stdout_logfile_backups=5
+          environment=HOME="/home/ubuntu",USER="ubuntu"
+          EOF
+
+          # Gracefully reload if supervisord is already running, else start fresh
+          SUPERVISORD_BIN="$(conda run -n ml which supervisord)"
+          SUPERVISORCTL_BIN="$(conda run -n ml which supervisorctl)"
+
+          if "$SUPERVISORCTL_BIN" -c supervisord.conf status > /dev/null 2>&1; then
+            echo "supervisord already running — reloading..."
+            "$SUPERVISORCTL_BIN" -c supervisord.conf reread
+            "$SUPERVISORCTL_BIN" -c supervisord.conf update
+            "$SUPERVISORCTL_BIN" -c supervisord.conf restart hate-speech-app
+          else
+            echo "Starting supervisord..."
+            # Kill any stale pid
+            if [ -f logs/supervisord.pid ]; then
+              kill "$(cat logs/supervisord.pid)" 2>/dev/null || true
+              rm -f logs/supervisord.pid
+            fi
+            "$SUPERVISORD_BIN" -c supervisord.conf
+          fi
+
+          echo "Waiting for app to start..."
+          sleep 15
+          ENDSSH
+
+      - name: Verify deployment
+        run: |
+          ssh ec2 "bash -s" << 'ENDSSH'
+          set -e
+          source /home/ubuntu/miniconda3/etc/profile.d/conda.sh
+          conda activate ml
+          cd /home/ubuntu/hate-speech-detection
+
+          STATUS=$(supervisorctl -c supervisord.conf status hate-speech-app)
+          echo "$STATUS"
+
+          if echo "$STATUS" | grep -q "RUNNING"; then
+            echo "Deployment verified - app is running"
+          else
+            echo "Deployment FAILED - app is not running"
+            tail -50 logs/app.log
+            tail -20 logs/app.error.log
+            exit 1
+          fi
+          ENDSSH
